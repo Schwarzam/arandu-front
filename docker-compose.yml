@@ -6,6 +6,10 @@ services:
     restart: unless-stopped
     environment:
       ADSS_BASE_URL: ${ADSS_BASE_URL:-https://ai-scope.cbpf.br}
+      # Credentials used to obtain a fresh token for the daily calendar runner.
+      ADSS_SERVICE_USERNAME: ${ADSS_SERVICE_USERNAME:arandu_user}
+      ADSS_SERVICE_PASSWORD: ${ADSS_SERVICE_PASSWORD:Asdflkjh3123!}
+      CALENDAR_CACHE_LOOKBACK_DAYS: ${CALENDAR_CACHE_LOOKBACK_DAYS:-370}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       # Nginx gives production a same-origin API. This is only relevant when
       # connecting directly to the API in development.

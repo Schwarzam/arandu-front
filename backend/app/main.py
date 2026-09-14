@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import math
+import contextlib
+import logging
 import os
 import secrets
 from datetime import date, datetime, timedelta, timezone
@@ -20,11 +21,38 @@ import pyarrow.parquet as pq
 from pydantic import BaseModel, Field
 
 ADSS_BASE_URL = os.getenv("ADSS_BASE_URL", "https://ai-scope.cbpf.br").rstrip("/")
+ADSS_SERVICE_USERNAME = os.getenv("ADSS_SERVICE_USERNAME")
+ADSS_SERVICE_PASSWORD = os.getenv("ADSS_SERVICE_PASSWORD")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 DOCS_DIR = Path(os.getenv("DOCS_DIR", "docs")).resolve()
+CALENDAR_CACHE_LOOKBACK_DAYS = int(os.getenv("CALENDAR_CACHE_LOOKBACK_DAYS", "370"))
 
-app = FastAPI(title="Arandu Portal", version="0.1.0")
+# This intentionally contains tokens only, never user passwords.  Replace it
+# with Redis (and a TTL) when deploying more than one API process.
+sessions: dict[str, dict[str, Any]] = {}
+# Calendar totals belong to the server, not an individual browser session.
+# Deploy Redis or another shared cache when using more than one API process.
+calendar_cache: dict[str, dict[str, Any]] = {}
+calendar_jobs: set[tuple[str, str]] = set()
+calendar_runner_task: asyncio.Task[None] | None = None
+MJD_EPOCH = date(1858, 11, 17)
+logger = logging.getLogger(__name__)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_: FastAPI):
+    global calendar_runner_task
+    if ADSS_SERVICE_USERNAME and ADSS_SERVICE_PASSWORD:
+        calendar_runner_task = asyncio.create_task(run_calendar_refresh_loop())
+    yield
+    if calendar_runner_task:
+        calendar_runner_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await calendar_runner_task
+
+
+app = FastAPI(title="Arandu Portal", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
@@ -32,21 +60,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
-
-# This intentionally contains tokens only, never user passwords.  Replace it
-# with Redis (and a TTL) when deploying more than one API process.
-sessions: dict[str, dict[str, Any]] = {}
-# Calendar totals are kept after their first calculation so the same observing
-# day is not re-aggregated on every dashboard visit. Use Redis in multi-worker
-# production deployments.
-calendar_cache: dict[tuple[str, str], dict[str, Any]] = {}
-# Ranges currently being calculated. Keeping this separate prevents every
-# browser refresh from submitting the same expensive ADSS request.
-calendar_jobs: set[tuple[str, str, str]] = set()
-# A failed range is attempted at most once per UTC day, rather than being
-# repeatedly retried by every browser poll.
-calendar_attempts: set[tuple[str, str, str, str]] = set()
-MJD_EPOCH = date(1858, 11, 17)
 
 
 class LoginRequest(BaseModel):
@@ -91,6 +104,25 @@ async def adss_rows(session: dict[str, Any], query: str) -> list[dict[str, Any]]
         # ADSS may return a query error, a transient error, or malformed data.
         # Keep the server response private while giving the UI an actionable status.
         raise HTTPException(status_code=502, detail="ADSS could not complete the data query.") from exc
+
+
+async def adss_service_session() -> dict[str, str]:
+    """Log in the calendar worker and return a newly-issued ADSS token."""
+    if not ADSS_SERVICE_USERNAME or not ADSS_SERVICE_PASSWORD:
+        raise RuntimeError("ADSS service credentials are not configured")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{ADSS_BASE_URL}/adss/v1/auth/login",
+                data={"username": ADSS_SERVICE_USERNAME, "password": ADSS_SERVICE_PASSWORD},
+            )
+        response.raise_for_status()
+        token = response.json().get("access_token")
+        if not token:
+            raise RuntimeError("ADSS service login returned no access token")
+        return {"token": token}
+    except httpx.HTTPError as exc:
+        raise RuntimeError("ADSS service login failed") from exc
 
 
 @app.get("/api/health")
@@ -171,59 +203,77 @@ def documentation_asset(asset_path: str):
     return FileResponse(documentation_file(asset_path), headers={"Cache-Control": "public, max-age=3600"})
 
 
-async def refresh_calendar_range(subject: str, session: dict[str, Any], start: date, end: date) -> None:
-    """Populate a day's cache off-request using portable AstroQL syntax.
+async def refresh_calendar_range(session: dict[str, Any], start: date, end: date) -> None:
+    """Populate cached daily detection totals without fetching every source.
 
-    AstroQL deployments do not consistently support SQL casts, FLOOR, or
-    COUNT(DISTINCT). Fetching the two required columns and binning locally is
-    portable and means a query failure never breaks the calendar endpoint.
+    A count is issued for each UTC day so its range predicate can use the
+    ``dia_source.midpoint_mjd_tai`` index.  This avoids the former query which
+    transferred every source in a month and then counted them in this process.
+    AstroQL's aggregate support is portable; date truncation and DISTINCT are
+    not, so object totals are deliberately not computed here.
     """
-    job = (subject, start.isoformat(), end.isoformat())
+    job = (start.isoformat(), end.isoformat())
+    if job in calendar_jobs:
+        return
+    calendar_jobs.add(job)
     try:
-        first_mjd, last_mjd = (start - MJD_EPOCH).days, (end - MJD_EPOCH).days
-        rows = await adss_rows(session, f"""
-            SELECT midpoint_mjd_tai, dia_object_id
-            FROM arandu.dia_source
-            WHERE midpoint_mjd_tai >= {first_mjd}
-              AND midpoint_mjd_tai < {last_mjd}
-        """)
-        totals: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            try:
-                key = (MJD_EPOCH + timedelta(days=math.floor(float(row["midpoint_mjd_tai"])))).isoformat()
-                bucket = totals.setdefault(key, {"detections": 0, "objects": set()})
-                bucket["detections"] += 1
-                bucket["objects"].add(row["dia_object_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
         computed_on = datetime.now(timezone.utc).date().isoformat()
-        for offset in range((end - start).days):
-            key = (start + timedelta(days=offset)).isoformat()
-            bucket = totals.get(key, {"detections": 0, "objects": set()})
-            calendar_cache[(subject, key)] = {"computed_on": computed_on, "value": {"day": key, "objects": len(bucket["objects"]), "detections": bucket["detections"]}}
-    except HTTPException:
-        # Retain a prior completed value. The browser will retry tomorrow or
-        # when the range is requested again; it never receives this failure.
-        pass
+        semaphore = asyncio.Semaphore(8)
+
+        async def refresh_day(day: date) -> None:
+            key = day.isoformat()
+            if calendar_cache.get(key, {}).get("computed_on") == computed_on:
+                return
+            first_mjd, last_mjd = (day - MJD_EPOCH).days, (day + timedelta(days=1) - MJD_EPOCH).days
+            try:
+                async with semaphore:
+                    rows = await adss_rows(session, f"""
+                        SELECT COUNT(dia_source.midpoint_mjd_tai) AS detections
+                        FROM arandu.dia_source
+                        WHERE midpoint_mjd_tai >= {first_mjd}
+                          AND midpoint_mjd_tai < {last_mjd}
+                    """)
+                count = int(rows[0]["detections"]) if rows else 0
+                calendar_cache[key] = {
+                    "computed_on": computed_on,
+                    "value": {"day": key, "detections": count},
+                }
+            except (HTTPException, KeyError, TypeError, ValueError):
+                # Keep a prior completed value if this individual day fails.
+                # One bad query must not prevent the rest of a range caching.
+                return
+
+        await asyncio.gather(*(refresh_day(start + timedelta(days=offset)) for offset in range((end - start).days)))
     finally:
         calendar_jobs.discard(job)
+
+
+async def run_calendar_refresh_loop() -> None:
+    """Refresh the server-wide calendar cache once per UTC day with a fresh token."""
+    while True:
+        today = datetime.now(timezone.utc).date()
+        try:
+            await refresh_calendar_range(
+                await adss_service_session(),
+                today - timedelta(days=CALENDAR_CACHE_LOOKBACK_DAYS),
+                today + timedelta(days=1),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Daily calendar cache refresh failed")
+        now = datetime.now(timezone.utc)
+        next_run = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        await asyncio.sleep(max((next_run - now).total_seconds(), 1))
 
 
 @app.get("/api/calendar")
 async def calendar(start: date = Query(...), end: date = Query(...), session: dict[str, Any] = Depends(portal_session)):
     if end <= start or end - start > timedelta(days=370):
         raise HTTPException(status_code=422, detail="Choose a range from one to 370 days.")
-    subject = str(session["user"].get("id") or session["user"].get("username") or "unknown")
     requested_days = [start + timedelta(days=offset) for offset in range((end - start).days)]
-    computed_on = datetime.now(timezone.utc).date().isoformat()
-    stale = any(calendar_cache.get((subject, day.isoformat()), {}).get("computed_on") != computed_on for day in requested_days)
-    job = (subject, start.isoformat(), end.isoformat())
-    attempt = (*job, computed_on)
-    if stale and job not in calendar_jobs and attempt not in calendar_attempts:
-        calendar_jobs.add(job)
-        calendar_attempts.add(attempt)
-        asyncio.create_task(refresh_calendar_range(subject, {"token": session["token"]}, start, end))
-    return {"start": start, "end": end, "pending": job in calendar_jobs, "days": [calendar_cache.get((subject, day.isoformat()), {"value": {"day": day.isoformat(), "objects": 0, "detections": 0}})["value"] for day in requested_days]}
+    pending = bool(calendar_jobs) and any(day.isoformat() not in calendar_cache for day in requested_days)
+    return {"start": start, "end": end, "pending": pending, "days": [calendar_cache.get(day.isoformat(), {"value": {"day": day.isoformat(), "detections": 0}})["value"] for day in requested_days]}
 
 
 @app.post("/api/search/cone")
