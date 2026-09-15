@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Chart as ChartJS, Legend, LinearScale, PointElement, Tooltip } from 'chart.js'
 import { Scatter } from 'react-chartjs-2'
-import { BookOpen, CalendarDays, ChevronLeft, ChevronRight, Crosshair, LogIn, LogOut, RefreshCw, Search, X } from 'lucide-react'
+import { BookOpen, CalendarDays, ChevronLeft, ChevronRight, Crosshair, LogIn, LogOut, Moon, RefreshCw, Search, Sun, X } from 'lucide-react'
 
 ChartJS.register(LinearScale, PointElement, Tooltip, Legend)
 
@@ -24,7 +24,7 @@ const plusMonths = (value: Date, count: number) => new Date(Date.UTC(value.getUT
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
   const [username, setUsername] = useState(''), [password, setPassword] = useState(''), [error, setError] = useState(''), [busy, setBusy] = useState(false)
   async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); setError(''); try { onLogin((await api<{ user: User }>('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) })).user) } catch (err) { setError(err instanceof Error ? err.message : 'Could not sign in.') } finally { setBusy(false) } }
-  return <main className="login-shell"><form className="login-card" onSubmit={submit}><img src="/assets/logo.png" alt="Arandu" className="brand-logo" /><h1>Arandu Portal</h1><p>Sign in with your ADSS account to explore observing activity.</p><label>Username<input autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>{error && <p className="error">{error}</p>}<button disabled={busy}><LogIn size={17} /> {busy ? 'Signing in…' : 'Sign in'}</button></form></main>
+  return <main className="login-shell"><form className="login-card" onSubmit={submit}><img src="/assets/logo.png" alt="Arandu" className="brand-logo" /><h1>Arandu Portal</h1><p>Sign in with your ai-scope account to explore observing activity.</p><label>Username<input autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>{error && <p className="error">{error}</p>}<button disabled={busy}><LogIn size={17} /> {busy ? 'Signing in…' : 'Sign in'}</button></form></main>
 }
 
 function Calendar() {
@@ -55,7 +55,7 @@ function ObjectDetail({ id, onClose }: { id: number; onClose: () => void }) {
 
 function DiscoverySearch() {
   const [query, setQuery] = useState(''), [results, setResults] = useState<SearchObject[]>([]), [description, setDescription] = useState(''), [error, setError] = useState(''), [loading, setLoading] = useState(false), [objectId, setObjectId] = useState<number | null>(null), [suggestionsOpen, setSuggestionsOpen] = useState(false)
-  const suggestions = [{ value: '0.1 0.1 10/3600', title: 'Cone search', detail: 'RA · Dec · radius, in arcsec' }, { value: 'enricher:simple-transient-classifier', title: 'Enricher', detail: 'Objects evaluated by a model' }, { value: 'classification:candidate_transient', title: 'Classification', detail: 'Objects matching a prediction label' }, { value: 'last:25', title: 'Recent observations', detail: 'The newest 25 detection records' }, { value: 'last:25 classification:candidate_transient', title: 'Combined search', detail: 'Newest observations with a label' }]
+  const suggestions = [{ value: '0.12697 0.4635 10', title: 'Cone search', detail: 'RA · Dec · radius, in arcsec' }, { value: 'enricher:simple-transient-classifier', title: 'Enricher', detail: 'Objects evaluated by a model' }, { value: 'classification:candidate_transient', title: 'Classification', detail: 'Objects matching a prediction label' }, { value: 'last:25', title: 'Recent observations', detail: 'The newest 25 detection records' }, { value: 'last:25 classification:candidate_transient', title: 'Combined search', detail: 'Newest observations with a label' }]
   const matchingSuggestions = suggestions.filter(item => !query || `${item.value} ${item.title} ${item.detail}`.toLowerCase().includes(query.toLowerCase()))
   async function submit(event: FormEvent) {
     event.preventDefault(); if (!query.trim()) return; setLoading(true); setError(''); setResults([]); setDescription('')
@@ -77,10 +77,11 @@ function Docs() {
 }
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null), [page, setPage] = useState<'calendar' | 'search' | 'docs'>('calendar'), [checking, setChecking] = useState(true)
+  const [user, setUser] = useState<User | null>(null), [page, setPage] = useState<'calendar' | 'search' | 'docs'>('calendar'), [checking, setChecking] = useState(true), [theme, setTheme] = useState<'light' | 'dark'>(() => localStorage.getItem('arandu-theme') === 'dark' ? 'dark' : 'light')
   useEffect(() => { api<{ user: User }>('/api/auth/me').then(result => setUser(result.user)).catch(() => {}).finally(() => setChecking(false)) }, [])
+  useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('arandu-theme', theme) }, [theme])
   if (checking) return <main className="login-shell">Loading portal…</main>
   if (!user) return <Login onLogin={setUser} />
   async function logout() { await api('/api/auth/logout', { method: 'POST' }); setUser(null) }
-  return <div className="app-shell"><header><img src="/assets/logo.png" alt="Arandu" className="header-logo" /><nav><button className={page === 'calendar' ? 'active' : ''} onClick={() => setPage('calendar')}><CalendarDays size={18} /> Calendar</button><button className={page === 'search' ? 'active' : ''} onClick={() => setPage('search')}><Search size={18} /> Discovery</button><button className={page === 'docs' ? 'active' : ''} onClick={() => setPage('docs')}><BookOpen size={18} /> Docs</button></nav><div className="user-menu"><span>{user.name || user.username || user.email || 'ADSS user'}</span><button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button></div></header>{page === 'calendar' ? <Calendar /> : page === 'search' ? <DiscoverySearch /> : <Docs />}</div>
+  return <div className="app-shell"><header><img src="/assets/logo.png" alt="Arandu" className="header-logo" /><nav><button className={page === 'calendar' ? 'active' : ''} onClick={() => setPage('calendar')}><CalendarDays size={18} /> Calendar</button><button className={page === 'search' ? 'active' : ''} onClick={() => setPage('search')}><Search size={18} /> Discovery</button><button className={page === 'docs' ? 'active' : ''} onClick={() => setPage('docs')}><BookOpen size={18} /> Docs</button></nav><div className="user-menu"><button className="icon-button theme-toggle" title={`Use ${theme === 'light' ? 'dark' : 'light'} theme`} aria-label={`Use ${theme === 'light' ? 'dark' : 'light'} theme`} onClick={() => setTheme(value => value === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={17} /> : <Sun size={17} />}</button><span>{user.name || user.username || user.email || 'ADSS user'}</span><button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button></div></header>{page === 'calendar' ? <Calendar /> : page === 'search' ? <DiscoverySearch /> : <Docs />}</div>
 }
