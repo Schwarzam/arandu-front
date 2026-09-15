@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import logging
 import os
@@ -248,6 +250,19 @@ async def refresh_calendar_range(session: dict[str, Any], start: date, end: date
         calendar_jobs.discard(job)
 
 
+async def calendar_detection_count(session: dict[str, Any], day: date) -> int:
+    """Return the current detection count for one UTC calendar day."""
+    first_mjd = (day - MJD_EPOCH).days
+    last_mjd = (day + timedelta(days=1) - MJD_EPOCH).days
+    rows = await adss_rows(session, f"""
+        SELECT COUNT(dia_source.midpoint_mjd_tai) AS detections
+        FROM arandu.dia_source
+        WHERE midpoint_mjd_tai >= {first_mjd}
+          AND midpoint_mjd_tai < {last_mjd}
+    """)
+    return int(rows[0]["detections"]) if rows else 0
+
+
 async def run_calendar_refresh_loop() -> None:
     """Refresh the server-wide calendar cache once per UTC day with a fresh token."""
     while True:
@@ -273,7 +288,22 @@ async def calendar(start: date = Query(...), end: date = Query(...), session: di
         raise HTTPException(status_code=422, detail="Choose a range from one to 370 days.")
     requested_days = [start + timedelta(days=offset) for offset in range((end - start).days)]
     pending = bool(calendar_jobs) and any(day.isoformat() not in calendar_cache for day in requested_days)
-    return {"start": start, "end": end, "pending": pending, "days": [calendar_cache.get(day.isoformat(), {"value": {"day": day.isoformat(), "detections": 0}})["value"] for day in requested_days]}
+    today = datetime.now(timezone.utc).date()
+    days = [calendar_cache.get(day.isoformat(), {"value": {"day": day.isoformat(), "detections": 0}})["value"] for day in requested_days]
+
+    # Today's observations continue arriving after the daily cache is built.
+    # Replace only that entry with a live aggregate so the highlighted cell
+    # always reflects the current ADSS result for the signed-in user.
+    if today in requested_days:
+        try:
+            today_index = requested_days.index(today)
+            days[today_index] = {"day": today.isoformat(), "detections": await calendar_detection_count(session, today)}
+        except (HTTPException, KeyError, TypeError, ValueError):
+            # An unavailable live query should not take the calendar down; the
+            # last completed cache value remains the useful fallback.
+            pass
+
+    return {"start": start, "end": end, "pending": pending, "days": days}
 
 
 @app.post("/api/search/cone")
@@ -308,7 +338,32 @@ async def object_detail(object_id: int, session: dict[str, Any] = Depends(portal
         FROM arandu.dia_source s LEFT JOIN arandu.alert a USING (dia_source_id)
         WHERE s.dia_object_id = {object_id} ORDER BY s.midpoint_mjd_tai
     """)
-    return {"object": object_rows[0], "sources": source_rows}
+    enrichment_rows = await adss_rows(session, f"""
+        SELECT e.enrichment_id, e.dia_source_id, e.enricher_name, e.version,
+               e.value, e.additionals, e.enriched_at
+        FROM arandu.enrichment e JOIN arandu.dia_source s USING (dia_source_id)
+        WHERE s.dia_object_id = {object_id}
+        ORDER BY e.enriched_at DESC
+    """)
+    return {"object": object_rows[0], "sources": source_rows, "enrichments": enrichment_rows}
+
+
+def cutout_bytes(value: Any) -> bytes:
+    """Decode an alert cutout stored as a URL, data URI, or base64 FITS."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("cutout is empty")
+    payload = value.strip()
+    if payload.startswith(("http://", "https://")):
+        raise ValueError("cutout URL must be fetched separately")
+    if payload.startswith("data:"):
+        try:
+            return base64.b64decode(payload.split(",", 1)[1], validate=True)
+        except (IndexError, binascii.Error) as exc:
+            raise ValueError("cutout data URI is not valid base64") from exc
+    try:
+        return base64.b64decode(payload, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("cutout is not a supported URL or base64 FITS payload") from exc
 
 
 @app.get("/api/cutouts/{source_id}/{kind}.png")
@@ -320,10 +375,15 @@ async def cutout(source_id: int, kind: str, session: dict[str, Any] = Depends(po
     if not found or not found[0]["url"]:
         raise HTTPException(status_code=404, detail="Cutout unavailable.")
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            image_response = await client.get(found[0]["url"])
-            image_response.raise_for_status()
-        with fits.open(BytesIO(image_response.content), memmap=False) as hdul:
+        value = found[0]["url"]
+        if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+            async with httpx.AsyncClient(timeout=20) as client:
+                image_response = await client.get(value)
+                image_response.raise_for_status()
+            raw = image_response.content
+        else:
+            raw = cutout_bytes(value)
+        with fits.open(BytesIO(raw), memmap=False) as hdul:
             data = np.asarray(hdul[0].data, dtype=np.float32).squeeze()
         valid = data[np.isfinite(data)]
         if data.ndim != 2 or not valid.size:
