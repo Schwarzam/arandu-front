@@ -6,6 +6,7 @@ import binascii
 import contextlib
 import logging
 import os
+import re
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -73,6 +74,11 @@ class ConeSearch(BaseModel):
     ra: float = Field(ge=0, lt=360)
     dec: float = Field(ge=-90, le=90)
     radius_arcsec: float = Field(gt=0, le=7200)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class DiscoverySearch(BaseModel):
+    query: str = Field(min_length=1, max_length=256)
     limit: int = Field(default=100, ge=1, le=500)
 
 
@@ -324,6 +330,79 @@ async def cone_search(payload: ConeSearch, session: dict[str, Any] = Depends(por
         item["separation_arcsec"] = float(np.rad2deg(np.arccos(np.clip(cosine, -1, 1))) * 3600)
     result.sort(key=lambda item: item["separation_arcsec"])
     return {"objects": result}
+
+
+def object_ids_from_rows(rows: list[dict[str, Any]]) -> list[int]:
+    """Keep source-query object ids in their time-ranked order."""
+    return list(dict.fromkeys(int(row["dia_object_id"]) for row in rows if row.get("dia_object_id") is not None))
+
+
+def enrichment_label(value: Any) -> str | None:
+    if isinstance(value, dict) and value.get("label") is not None:
+        return str(value["label"])
+    return None
+
+
+async def objects_by_ids(session: dict[str, Any], object_ids: list[int]) -> list[dict[str, Any]]:
+    if not object_ids:
+        return []
+    identifiers = ", ".join(str(item) for item in object_ids)
+    rows = await adss_rows(session, f"""
+        SELECT dia_object_id, ra, dec, n_dia_sources, first_dia_source_mjd_tai, last_dia_source_mjd_tai
+        FROM arandu.dia_object WHERE dia_object_id IN ({identifiers})
+    """)
+    by_id = {int(row["dia_object_id"]): row for row in rows}
+    return [by_id[item] for item in object_ids if item in by_id]
+
+
+@app.post("/api/search/discovery")
+async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = Depends(portal_session)):
+    """Search objects through a concise, allow-listed discovery language."""
+    query = payload.query.strip()
+    cone_match = re.fullmatch(r"(?:cone:\s*)?([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)(?:\s*/\s*(\d+(?:\.\d+)?))?", query, flags=re.IGNORECASE)
+    if cone_match:
+        ra, dec, radius, divisor = (float(value) if value is not None else None for value in cone_match.groups())
+        radius_arcsec = radius / (divisor or 1)
+        if not 0 <= ra < 360 or not -90 <= dec <= 90 or not 0 < radius_arcsec <= 7200:
+            raise HTTPException(status_code=422, detail="Use RA 0–360, Dec −90–90, and a radius up to 7200 arcsec.")
+        return await cone_search(ConeSearch(ra=ra, dec=dec, radius_arcsec=radius_arcsec, limit=payload.limit), session)
+
+    directive_pattern = re.compile(r"(enricher|classification|last)\s*:\s*([A-Za-z0-9_.-]+)", flags=re.IGNORECASE)
+    directives = {match.group(1).lower(): match.group(2) for match in directive_pattern.finditer(query)}
+    if directives and not directive_pattern.sub("", query).strip():
+        if len(directives) != len(list(directive_pattern.finditer(query))):
+            raise HTTPException(status_code=422, detail="Use each search filter at most once.")
+        last_value = directives.get("last")
+        if last_value is not None and not last_value.isdecimal():
+            raise HTTPException(status_code=422, detail="The number after last: must be an integer.")
+        count = min(int(last_value) if last_value is not None else payload.limit, payload.limit)
+        if count < 1:
+            raise HTTPException(status_code=422, detail="The number after last: must be at least one.")
+        enricher = directives.get("enricher")
+        classification = directives.get("classification")
+        if not enricher and not classification:
+            rows = await adss_rows(session, f"""
+                SELECT TOP {count} dia_object_id FROM arandu.dia_source
+                ORDER BY midpoint_mjd_tai DESC
+            """)
+            return {"objects": await objects_by_ids(session, object_ids_from_rows(rows)), "description": f"Newest {count} detections"}
+        where = f"WHERE e.enricher_name = '{enricher}'" if enricher else ""
+        rows = await adss_rows(session, f"""
+            SELECT TOP {count * 40} s.dia_object_id, e.value
+            FROM arandu.enrichment e JOIN arandu.dia_source s USING (dia_source_id)
+            {where}
+            ORDER BY s.midpoint_mjd_tai DESC
+        """)
+        matched_rows = [row for row in rows if classification is None or enrichment_label(row.get("value")) == classification]
+        description = f"Objects enriched by {enricher}" if enricher else f"Objects classified as {classification}"
+        if enricher and classification:
+            description += f" · {classification}"
+        if "last" in directives:
+            description = f"Newest {count} matching observations · {description}"
+        result_rows = matched_rows[:count] if "last" in directives else matched_rows
+        return {"objects": await objects_by_ids(session, object_ids_from_rows(result_rows)[:payload.limit]), "description": description}
+
+    raise HTTPException(status_code=422, detail="Try a cone such as 0.1 0.1 10/3600, enricher:<name>, classification:<label>, or last:<count>.")
 
 
 @app.get("/api/objects/{object_id}")
