@@ -1,0 +1,17 @@
+Arandu – Brand Colors
+
+Primary
+Deep Blue
+HEX: #153B50
+
+Secondary
+Verde
+HEX: #3FCCD0
+
+Cor de fundo - Neutral
+Palha
+HEX: #EFE9D9
+
+Accent Gradient
+Start: #3FCCD0
+End: #2C7D80

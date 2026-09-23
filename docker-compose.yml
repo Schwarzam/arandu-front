@@ -16,6 +16,9 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     expose:
       - "8000"
+    volumes:
+      # Read docs from the checkout so edits are immediately reflected by the API.
+      - ./docs:/app/docs:ro
 
   nginx:
     build: ./frontend

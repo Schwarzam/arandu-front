@@ -1,11 +1,11 @@
 import type { Config } from 'tailwindcss'
 
 const lightTheme = {
-  '--color-canvas': '#f6f8fa', '--color-surface': '#fff', '--color-surface-muted': '#f0f4f6', '--color-surface-raised': '#fbfcfd', '--color-text': '#152935', '--color-muted': '#627782', '--color-line': '#d7e0e4', '--color-line-strong': '#aebfc6', '--color-accent': '#087c83', '--color-accent-strong': '#045d63', '--color-accent-muted': '#e1f1f0', '--color-danger': '#b42335', '--color-danger-muted': '#fff0f1', '--color-code': '#edf3f5', '--color-overlay': '#0b202dcc', '--shadow': '0 12px 28px #1529350d',
+  '--color-canvas': '#EFE9D9', '--color-surface': '#fffdf7', '--color-surface-muted': '#f6f0e2', '--color-surface-raised': '#fffaf0', '--color-text': '#153B50', '--color-muted': '#527080', '--color-line': '#d9d1bd', '--color-line-strong': '#aca28d', '--color-accent': '#3FCCD0', '--color-accent-strong': '#2C7D80', '--color-accent-muted': '#dff5f3', '--color-danger': '#a43b45', '--color-danger-muted': '#fdebed', '--color-code': '#f0ece0', '--color-overlay': '#153B50cc', '--shadow': '0 12px 28px #153B501a',
 }
 
 const darkTheme = {
-  '--color-canvas': '#10191e', '--color-surface': '#162228', '--color-surface-muted': '#1d2b32', '--color-surface-raised': '#1a272e', '--color-text': '#e5eef0', '--color-muted': '#a9bdc4', '--color-line': '#31434b', '--color-line-strong': '#59707a', '--color-accent': '#55c4c5', '--color-accent-strong': '#91e1dc', '--color-accent-muted': '#163b40', '--color-danger': '#ff8d99', '--color-danger-muted': '#42232a', '--color-code': '#223239', '--color-overlay': '#02090de0', '--shadow': '0 12px 28px #0000003b',
+  '--color-canvas': '#102f42', '--color-surface': '#153B50', '--color-surface-muted': '#1d4c62', '--color-surface-raised': '#194359', '--color-text': '#fffdf7', '--color-muted': '#c4d6d5', '--color-line': '#356074', '--color-line-strong': '#63889a', '--color-accent': '#3FCCD0', '--color-accent-strong': '#76e5e5', '--color-accent-muted': '#1d5b68', '--color-danger': '#ff9ca5', '--color-danger-muted': '#60313b', '--color-code': '#214b5d', '--color-overlay': '#071d2ae0', '--shadow': '0 12px 28px #071d2a80',
 }
 
 export default {

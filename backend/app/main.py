@@ -18,7 +18,7 @@ import numpy as np
 from astropy.io import fits
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field
@@ -195,7 +195,7 @@ def documentation_index():
         relative = file.relative_to(DOCS_DIR).as_posix()
         title = next((line.removeprefix("# ").strip() for line in file.read_text(encoding="utf-8").splitlines() if line.startswith("# ")), file.stem.replace("-", " ").title())
         documents.append({"path": relative, "title": title, "section": str(Path(relative).parent) if Path(relative).parent != Path(".") else "General"})
-    return {"documents": documents}
+    return JSONResponse(content={"documents": documents}, headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.get("/api/docs/{document_path:path}")
@@ -203,12 +203,12 @@ def documentation_page(document_path: str):
     file = documentation_file(document_path)
     if file.suffix.lower() != ".md":
         raise HTTPException(status_code=404, detail="Documentation page not found.")
-    return {"path": document_path, "markdown": file.read_text(encoding="utf-8")}
+    return JSONResponse(content={"path": document_path, "markdown": file.read_text(encoding="utf-8")}, headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.get("/api/docs-assets/{asset_path:path}")
 def documentation_asset(asset_path: str):
-    return FileResponse(documentation_file(asset_path), headers={"Cache-Control": "public, max-age=3600"})
+    return FileResponse(documentation_file(asset_path), headers={"Cache-Control": "no-store, max-age=0"})
 
 
 async def refresh_calendar_range(session: dict[str, Any], start: date, end: date) -> None:
