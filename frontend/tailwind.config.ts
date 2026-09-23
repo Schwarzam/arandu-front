@@ -5,7 +5,28 @@ const lightTheme = {
 }
 
 const darkTheme = {
-  '--color-canvas': '#102f42', '--color-surface': '#153B50', '--color-surface-muted': '#1d4c62', '--color-surface-raised': '#194359', '--color-text': '#fffdf7', '--color-muted': '#c4d6d5', '--color-line': '#356074', '--color-line-strong': '#63889a', '--color-accent': '#3FCCD0', '--color-accent-strong': '#76e5e5', '--color-accent-muted': '#1d5b68', '--color-danger': '#ff9ca5', '--color-danger-muted': '#60313b', '--color-code': '#214b5d', '--color-overlay': '#071d2ae0', '--shadow': '0 12px 28px #071d2a80',
+  '--color-canvas': '#181A1B',
+  '--color-surface': '#202324',
+  '--color-surface-muted': '#292D2E',
+  '--color-surface-raised': '#252829',
+
+  '--color-text': '#F5F5F2',
+  '--color-muted': '#AEB5B5',
+
+  '--color-line': '#3A3F40',
+  '--color-line-strong': '#5A6263',
+
+  '--color-accent': '#42C7C7',
+  '--color-accent-strong': '#75DEDC',
+  '--color-accent-muted': '#254B4B',
+
+  '--color-danger': '#F08E96',
+  '--color-danger-muted': '#543035',
+
+  '--color-code': '#272B2C',
+  '--color-overlay': '#101112E6',
+
+  '--shadow': '0 12px 28px #00000066',
 }
 
 export default {
