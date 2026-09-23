@@ -1,4 +1,4 @@
-# Welcome to the Arandu portalasdijuasgh8udysago
+# Welcome to the Arandu portal
 
 Arandu is a workspace for exploring transient alerts, their photometry, and associated image cutouts.
 asdasda

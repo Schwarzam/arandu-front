@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 import numpy as np
@@ -367,7 +368,7 @@ async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = D
             raise HTTPException(status_code=422, detail="Use RA 0–360, Dec −90–90, and a radius up to 7200 arcsec.")
         return await cone_search(ConeSearch(ra=ra, dec=dec, radius_arcsec=radius_arcsec, limit=payload.limit), session)
 
-    directive_pattern = re.compile(r"(enricher|classification|last)\s*:\s*([A-Za-z0-9_.-]+)", flags=re.IGNORECASE)
+    directive_pattern = re.compile(r"(classification|last)\s*:\s*([A-Za-z0-9_.-]+)", flags=re.IGNORECASE)
     directives = {match.group(1).lower(): match.group(2) for match in directive_pattern.finditer(query)}
     if directives and not directive_pattern.sub("", query).strip():
         if len(directives) != len(list(directive_pattern.finditer(query))):
@@ -378,31 +379,26 @@ async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = D
         count = min(int(last_value) if last_value is not None else payload.limit, payload.limit)
         if count < 1:
             raise HTTPException(status_code=422, detail="The number after last: must be at least one.")
-        enricher = directives.get("enricher")
         classification = directives.get("classification")
-        if not enricher and not classification:
+        if not classification:
             rows = await adss_rows(session, f"""
                 SELECT TOP {count} dia_object_id FROM arandu.dia_source
                 ORDER BY midpoint_mjd_tai DESC
             """)
             return {"objects": await objects_by_ids(session, object_ids_from_rows(rows)), "description": f"Newest {count} detections"}
-        where = f"WHERE e.enricher_name = '{enricher}'" if enricher else ""
         rows = await adss_rows(session, f"""
             SELECT TOP {count * 40} s.dia_object_id, e.value
             FROM arandu.enrichment e JOIN arandu.dia_source s USING (dia_source_id)
-            {where}
             ORDER BY s.midpoint_mjd_tai DESC
         """)
-        matched_rows = [row for row in rows if classification is None or enrichment_label(row.get("value")) == classification]
-        description = f"Objects enriched by {enricher}" if enricher else f"Objects classified as {classification}"
-        if enricher and classification:
-            description += f" · {classification}"
+        matched_rows = [row for row in rows if enrichment_label(row.get("value")) == classification]
+        description = f"Objects classified as {classification}"
         if "last" in directives:
             description = f"Newest {count} matching observations · {description}"
         result_rows = matched_rows[:count] if "last" in directives else matched_rows
         return {"objects": await objects_by_ids(session, object_ids_from_rows(result_rows)[:payload.limit]), "description": description}
 
-    raise HTTPException(status_code=422, detail="Try a cone such as 0.1 0.1 10/3600, enricher:<name>, classification:<label>, or last:<count>.")
+    raise HTTPException(status_code=422, detail="Try a cone such as 0.1 0.1 10/3600, classification:<label>, or last:<count>.")
 
 
 @app.get("/api/objects/{object_id}")
@@ -455,9 +451,11 @@ async def cutout(source_id: int, kind: str, session: dict[str, Any] = Depends(po
         raise HTTPException(status_code=404, detail="Cutout unavailable.")
     try:
         value = found[0]["url"]
-        if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
-            async with httpx.AsyncClient(timeout=20) as client:
-                image_response = await client.get(value)
+        if isinstance(value, str) and (value.strip().startswith(("http://", "https://")) or value.strip().startswith("/")):
+            image_url = urljoin(f"{ADSS_BASE_URL}/", value.strip())
+            headers = {"Authorization": f"Bearer {session['token']}"} if urlsplit(image_url).netloc == urlsplit(ADSS_BASE_URL).netloc else {}
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                image_response = await client.get(image_url, headers=headers)
                 image_response.raise_for_status()
             raw = image_response.content
         else:
