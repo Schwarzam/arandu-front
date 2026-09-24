@@ -27,3 +27,7 @@ services:
       - api
     ports:
       - "5001:80"
+    volumes:
+      # Cutout PNGs are produced outside this checkout.  Mount them read-only
+      # so Nginx can serve them without sending each image through the API.
+      - /home/astrodados4/arandu/data/cutouts:/usr/share/nginx/cutouts:ro

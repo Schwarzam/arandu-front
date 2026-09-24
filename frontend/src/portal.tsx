@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Bar, Scatter } from 'react-chartjs-2'
@@ -21,6 +21,39 @@ const monthLabel = (value: Date) => value.toLocaleDateString(undefined, { month:
 const firstOfMonth = (value: Date) => new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), 1))
 const plusMonths = (value: Date, count: number) => new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + count, 1))
 const themeColor = (token: string) => getComputedStyle(document.documentElement).getPropertyValue(token).trim()
+
+function renderFits(buffer: ArrayBuffer, canvas: HTMLCanvasElement) {
+  const bytes = new Uint8Array(buffer), decoder = new TextDecoder('ascii'), header = new Map<string, string>()
+  let headerEnd = -1
+  for (let offset = 0; offset + 80 <= bytes.length; offset += 80) {
+    const card = decoder.decode(bytes.subarray(offset, offset + 80)), key = card.slice(0, 8).trim()
+    if (key === 'END') { headerEnd = offset + 80; break }
+    if (card[8] === '=') header.set(key, card.slice(10).split('/')[0].trim())
+  }
+  const width = Number(header.get('NAXIS1')), height = Number(header.get('NAXIS2')), bitpix = Number(header.get('BITPIX'))
+  const bytesPerPixel = Math.abs(bitpix) / 8, dataOffset = Math.ceil(headerEnd / 2880) * 2880
+  if (headerEnd < 0 || !Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || ![8, 16, 32, -32, -64].includes(bitpix) || dataOffset + width * height * bytesPerPixel > bytes.length) throw new Error('Unsupported FITS image')
+  const scale = Number(header.get('BSCALE') ?? 1), zero = Number(header.get('BZERO') ?? 0), view = new DataView(buffer), values = new Float32Array(width * height)
+  for (let index = 0; index < values.length; index++) {
+    const offset = dataOffset + index * bytesPerPixel
+    const raw = bitpix === 8 ? view.getUint8(offset) : bitpix === 16 ? view.getInt16(offset, false) : bitpix === 32 ? view.getInt32(offset, false) : bitpix === -32 ? view.getFloat32(offset, false) : view.getFloat64(offset, false)
+    values[index] = raw * scale + zero
+  }
+  const finite = Array.from(values).filter(Number.isFinite).sort((a, b) => a - b)
+  if (!finite.length) throw new Error('FITS image has no finite pixels')
+  const lo = finite[Math.floor((finite.length - 1) * .01)], hi = finite[Math.floor((finite.length - 1) * .99)], image = new ImageData(width, height)
+  for (let index = 0; index < values.length; index++) {
+    const intensity = !Number.isFinite(values[index]) || hi <= lo ? 0 : Math.max(0, Math.min(255, Math.round((values[index] - lo) * 255 / (hi - lo))))
+    const pixel = index * 4; image.data[pixel] = intensity; image.data[pixel + 1] = intensity; image.data[pixel + 2] = intensity; image.data[pixel + 3] = 255
+  }
+  canvas.width = width; canvas.height = height; canvas.getContext('2d')?.putImageData(image, 0, 0)
+}
+
+function FitsCutout({ src, alt }: { src: string; alt: string }) {
+  const canvas = useRef<HTMLCanvasElement>(null), [error, setError] = useState(false)
+  useEffect(() => { let cancelled = false; setError(false); fetch(src).then(response => { if (!response.ok) throw new Error('Cutout unavailable'); return response.arrayBuffer() }).then(buffer => { if (!cancelled && canvas.current) renderFits(buffer, canvas.current) }).catch(() => !cancelled && setError(true)); return () => { cancelled = true } }, [src])
+  return error ? <p className="cutout-error">Unavailable</p> : <canvas ref={canvas} role="img" aria-label={alt} />
+}
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
   const [username, setUsername] = useState(''), [password, setPassword] = useState(''), [error, setError] = useState(''), [busy, setBusy] = useState(false)
@@ -54,7 +87,7 @@ function ObjectDetail({ id, onClose }: { id: number; onClose: () => void }) {
   const chartOptions = { responsive: true, maintainAspectRatio: false, onClick: (_event: unknown, elements: any[], chart: any) => { const point = elements[0]; if (point) setSourceId(chart.data.datasets[point.datasetIndex].data[point.index].sourceId) }, plugins: { legend: { position: 'top' as const }, tooltip: { callbacks: { label: (context: any) => `${context.dataset.label}: MJD ${Number(context.parsed.x).toFixed(5)}, flux ${Number(context.parsed.y).toFixed(3)}` } } }, scales: { x: { type: 'linear' as const, title: { display: true, text: 'MJD TAI' }, min: minX, max: maxX }, y: { title: { display: true, text: 'PSF flux' }, min: minY, max: maxY } } }
   const active = detail?.sources.find(item => item.dia_source_id === sourceId)
   const activeEnrichments = detail?.enrichments.filter(item => item.dia_source_id === sourceId) ?? []
-  return <div className="detail-backdrop" role="dialog" aria-modal="true"><section className="detail-panel"><button className="close-button" onClick={onClose} aria-label="Close details"><X /></button>{error && <p className="error">{error}</p>}{!detail && !error && <p>Loading object…</p>}{detail && <><span className="eyebrow">DIA object</span><h2>{detail.object.dia_object_id}</h2><p className="muted">RA {Number(detail.object.ra).toFixed(6)}° · Dec {Number(detail.object.dec).toFixed(6)}° · {detail.sources.length} detections</p><h3>PSF flux light curve</h3>{points.length ? <><div className="lightcurve"><Scatter data={chartData} options={chartOptions} /></div><p className="muted plot-note">Select a point to inspect that detection’s enrichments and cutouts.</p></> : <p className="muted">No usable flux points are available.</p>}<h3>Detection enrichments</h3>{active ? <><p className="muted">MJD {Number(active.midpoint_mjd_tai).toFixed(5)} {active.band ? `(${active.band})` : ''}</p>{activeEnrichments.length ? <div className="enrichment-tags">{activeEnrichments.map(item => <span className="enrichment-tag" key={item.enrichment_id}>{item.enricher_name} · v{item.version}{item.value?.label ? ` · ${item.value.label}` : ''}</span>)}</div> : <p className="muted">No enrichments are available for this detection.</p>}</> : <p className="muted">Select a detection to view its enrichments.</p>}<h3>Image cutouts</h3>{detail.sources.length ? <><label className="epoch-picker">Detection epoch<select value={sourceId ?? ''} onChange={e => setSourceId(Number(e.target.value))}>{detail.sources.map(item => <option key={item.dia_source_id} value={item.dia_source_id}>MJD {Number(item.midpoint_mjd_tai).toFixed(5)} {item.band ? `(${item.band})` : ''}</option>)}</select></label>{active && <div className="cutouts">{(['science', 'template', 'difference'] as const).map(kind => <figure key={kind}><img src={`/api/cutouts/${active.dia_source_id}/${kind}.png`} alt={`${kind} cutout`} /><figcaption>{kind}</figcaption></figure>)}</div>}</> : <p className="muted">No cutouts available.</p>}</>}</section></div>
+  return <div className="detail-backdrop" role="dialog" aria-modal="true"><section className="detail-panel"><button className="close-button" onClick={onClose} aria-label="Close details"><X /></button>{error && <p className="error">{error}</p>}{!detail && !error && <p>Loading object…</p>}{detail && <><span className="eyebrow">DIA object</span><h2>{detail.object.dia_object_id}</h2><p className="muted">RA {Number(detail.object.ra).toFixed(6)}° · Dec {Number(detail.object.dec).toFixed(6)}° · {detail.sources.length} detections</p><h3>PSF flux light curve</h3>{points.length ? <><div className="lightcurve"><Scatter data={chartData} options={chartOptions} /></div><p className="muted plot-note">Select a point to inspect that detection’s enrichments and cutouts.</p></> : <p className="muted">No usable flux points are available.</p>}<h3>Detection enrichments</h3>{active ? <><p className="muted">MJD {Number(active.midpoint_mjd_tai).toFixed(5)} {active.band ? `(${active.band})` : ''}</p>{activeEnrichments.length ? <div className="enrichment-tags">{activeEnrichments.map(item => <span className="enrichment-tag" key={item.enrichment_id}>{item.enricher_name} · v{item.version}{item.value?.label ? ` · ${item.value.label}` : ''}</span>)}</div> : <p className="muted">No enrichments are available for this detection.</p>}</> : <p className="muted">Select a detection to view its enrichments.</p>}<h3>Image cutouts</h3>{detail.sources.length ? <><label className="epoch-picker">Detection epoch<select value={sourceId ?? ''} onChange={e => setSourceId(Number(e.target.value))}>{detail.sources.map(item => <option key={item.dia_source_id} value={item.dia_source_id}>MJD {Number(item.midpoint_mjd_tai).toFixed(5)} {item.band ? `(${item.band})` : ''}</option>)}</select></label>{active && <div className="cutouts">{(['science', 'template', 'difference'] as const).map(kind => <figure key={kind}><FitsCutout src={`/cutouts/${active.dia_source_id}/${kind}.fits`} alt={`${kind} cutout`} /><figcaption>{kind}</figcaption></figure>)}</div>}</> : <p className="muted">No cutouts available.</p>}</>}</section></div>
 }
 
 function DiscoverySearch() {

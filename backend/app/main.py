@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import contextlib
 import logging
 import os
@@ -12,15 +10,12 @@ from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
 
 import httpx
 import numpy as np
-from astropy.io import fits
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from PIL import Image
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field
 
@@ -408,9 +403,8 @@ async def object_detail(object_id: int, session: dict[str, Any] = Depends(portal
         raise HTTPException(status_code=404, detail="Object not found.")
     source_rows = await adss_rows(session, f"""
         SELECT TOP 10000 s.dia_source_id, s.midpoint_mjd_tai, s.ra, s.dec, s.band,
-               s.psf_flux, s.psf_flux_err, s.snr, s.reliability,
-               a.cutout_science, a.cutout_template, a.cutout_difference
-        FROM arandu.dia_source s LEFT JOIN arandu.alert a USING (dia_source_id)
+               s.psf_flux, s.psf_flux_err, s.snr, s.reliability
+        FROM arandu.dia_source s
         WHERE s.dia_object_id = {object_id} ORDER BY s.midpoint_mjd_tai
     """)
     enrichment_rows = await adss_rows(session, f"""
@@ -421,53 +415,3 @@ async def object_detail(object_id: int, session: dict[str, Any] = Depends(portal
         ORDER BY e.enriched_at DESC
     """)
     return {"object": object_rows[0], "sources": source_rows, "enrichments": enrichment_rows}
-
-
-def cutout_bytes(value: Any) -> bytes:
-    """Decode an alert cutout stored as a URL, data URI, or base64 FITS."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("cutout is empty")
-    payload = value.strip()
-    if payload.startswith(("http://", "https://")):
-        raise ValueError("cutout URL must be fetched separately")
-    if payload.startswith("data:"):
-        try:
-            return base64.b64decode(payload.split(",", 1)[1], validate=True)
-        except (IndexError, binascii.Error) as exc:
-            raise ValueError("cutout data URI is not valid base64") from exc
-    try:
-        return base64.b64decode(payload, validate=True)
-    except binascii.Error as exc:
-        raise ValueError("cutout is not a supported URL or base64 FITS payload") from exc
-
-
-@app.get("/api/cutouts/{source_id}/{kind}.png")
-async def cutout(source_id: int, kind: str, session: dict[str, Any] = Depends(portal_session)):
-    columns = {"science": "cutout_science", "template": "cutout_template", "difference": "cutout_difference"}
-    if kind not in columns:
-        raise HTTPException(status_code=404, detail="Unknown cutout type.")
-    found = await adss_rows(session, f"SELECT {columns[kind]} AS url FROM arandu.alert WHERE dia_source_id = {source_id}")
-    if not found or not found[0]["url"]:
-        raise HTTPException(status_code=404, detail="Cutout unavailable.")
-    try:
-        value = found[0]["url"]
-        if isinstance(value, str) and (value.strip().startswith(("http://", "https://")) or value.strip().startswith("/")):
-            image_url = urljoin(f"{ADSS_BASE_URL}/", value.strip())
-            headers = {"Authorization": f"Bearer {session['token']}"} if urlsplit(image_url).netloc == urlsplit(ADSS_BASE_URL).netloc else {}
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                image_response = await client.get(image_url, headers=headers)
-                image_response.raise_for_status()
-            raw = image_response.content
-        else:
-            raw = cutout_bytes(value)
-        with fits.open(BytesIO(raw), memmap=False) as hdul:
-            data = np.asarray(hdul[0].data, dtype=np.float32).squeeze()
-        valid = data[np.isfinite(data)]
-        if data.ndim != 2 or not valid.size:
-            raise ValueError("cutout has no usable 2D image")
-        lo, hi = np.percentile(valid, (1, 99))
-        scaled = np.zeros(data.shape, dtype=np.uint8) if hi <= lo else np.clip((data - lo) * 255 / (hi - lo), 0, 255).astype(np.uint8)
-        output = BytesIO(); Image.fromarray(scaled).save(output, format="PNG", optimize=True)
-        return Response(output.getvalue(), media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
-    except (httpx.HTTPError, OSError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="Could not render this FITS cutout.") from exc
