@@ -1,0 +1,17 @@
+{
+  "name": "Arandu Portal",
+  "short_name": "Arandu",
+  "description": "Data portal for alerts from NASA's Nancy Grace Roman Space Telescope.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f8f7",
+  "theme_color": "#0b6770",
+  "icons": [
+    {
+      "src": "/assets/arandu-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

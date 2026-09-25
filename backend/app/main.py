@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
 import secrets
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -26,6 +28,10 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 DOCS_DIR = Path(os.getenv("DOCS_DIR", "docs")).resolve()
 CALENDAR_CACHE_LOOKBACK_DAYS = int(os.getenv("CALENDAR_CACHE_LOOKBACK_DAYS", "370"))
+# Local development reads the monitor directly from the host. Docker Compose
+# overrides this with its read-only /monitor-data bind mount.
+MONITOR_HISTORY_PATH = Path(os.getenv("MONITOR_HISTORY_PATH", "/home/schwarz/arandu/data/monitor-history.jsonl"))
+MONITOR_HISTORY_MAX_SAMPLES = max(1, int(os.getenv("MONITOR_HISTORY_MAX_SAMPLES", "1440")))
 
 # This intentionally contains tokens only, never user passwords.  Replace it
 # with Redis (and a TTL) when deploying more than one API process.
@@ -132,6 +138,65 @@ async def adss_service_session() -> dict[str, str]:
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+def monitor_ok(snapshot: dict[str, Any]) -> bool:
+    """Return whether every primary dependency reported healthy in a sample."""
+    return all(snapshot.get(name, {}).get("ok") is True for name in ("raw_stream", "ingest_stream", "postgres"))
+
+
+def read_monitor_history() -> list[dict[str, Any]]:
+    """Read a bounded tail of JSONL monitor samples, skipping an incomplete write."""
+    try:
+        with MONITOR_HISTORY_PATH.open("r", encoding="utf-8") as history:
+            lines = deque(history, maxlen=MONITOR_HISTORY_MAX_SAMPLES)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="Monitor history is not available on this server.")
+    except OSError as exc:
+        logger.exception("Could not read monitor history")
+        raise HTTPException(status_code=503, detail="Monitor history could not be read.") from exc
+
+    samples = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+            if isinstance(value, dict) and isinstance(value.get("timestamp"), str):
+                samples.append(value)
+        except json.JSONDecodeError:
+            # The writer can be in the middle of its newest JSONL record.
+            continue
+    return samples
+
+
+@app.get("/api/status")
+def monitor_status(_: dict[str, Any] = Depends(portal_session)):
+    samples = read_monitor_history()
+    if not samples:
+        raise HTTPException(status_code=503, detail="Monitor history does not contain any valid samples yet.")
+
+    latest = samples[-1]
+    history = [
+        {
+            "timestamp": sample["timestamp"],
+            "services": {
+                "alerts": sample.get("raw_stream", {}).get("ok") is True,
+                "processing": sample.get("ingest_stream", {}).get("ok") is True,
+                "catalog": sample.get("postgres", {}).get("ok") is True,
+                "cutouts": sample.get("cutouts", {}).get("exists") is True,
+            },
+            "queue": {
+                "alerts": sample.get("raw_stream", {}).get("length", 0),
+                "processing": sample.get("ingest_stream", {}).get("length", 0),
+            },
+        }
+        for sample in samples
+    ]
+    return {
+        "latest": latest,
+        "history": history,
+        "sample_count": len(samples),
+        "all_services_healthy": monitor_ok(latest),
+    }
 
 
 @app.post("/api/auth/login")

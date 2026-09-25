@@ -10,6 +10,9 @@ services:
       ADSS_SERVICE_USERNAME: ${ADSS_SERVICE_USERNAME:-}
       ADSS_SERVICE_PASSWORD: ${ADSS_SERVICE_PASSWORD:-}
       CALENDAR_CACHE_LOOKBACK_DAYS: ${CALENDAR_CACHE_LOOKBACK_DAYS:-370}
+      # JSONL samples written by the Arandu monitor. Override this path when
+      # using a differently named mount in another deployment.
+      MONITOR_HISTORY_PATH: ${MONITOR_HISTORY_PATH:-/monitor-data/monitor-history.jsonl}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       # Nginx gives production a same-origin API. This is only relevant when
       # connecting directly to the API in development.
@@ -19,6 +22,7 @@ services:
     volumes:
       # Read docs from the checkout so edits are immediately reflected by the API.
       - ./docs:/app/docs:ro
+      - /home/schwarz/arandu/data/monitor-history.jsonl:/monitor-data/monitor-history.jsonl:ro
 
   nginx:
     build: ./frontend
