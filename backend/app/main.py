@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import secrets
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -15,16 +14,13 @@ from typing import Any
 
 import httpx
 import numpy as np
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field
 
 ADSS_BASE_URL = os.getenv("ADSS_BASE_URL", "https://ai-scope.cbpf.br").rstrip("/")
-ADSS_SERVICE_USERNAME = os.getenv("ADSS_SERVICE_USERNAME")
-ADSS_SERVICE_PASSWORD = os.getenv("ADSS_SERVICE_PASSWORD")
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 DOCS_DIR = Path(os.getenv("DOCS_DIR", "docs")).resolve()
 CALENDAR_CACHE_LOOKBACK_DAYS = int(os.getenv("CALENDAR_CACHE_LOOKBACK_DAYS", "370"))
@@ -33,9 +29,6 @@ CALENDAR_CACHE_LOOKBACK_DAYS = int(os.getenv("CALENDAR_CACHE_LOOKBACK_DAYS", "37
 MONITOR_HISTORY_PATH = Path(os.getenv("MONITOR_HISTORY_PATH", "/home/schwarz/arandu/data/monitor-history.jsonl"))
 MONITOR_HISTORY_MAX_SAMPLES = max(1, int(os.getenv("MONITOR_HISTORY_MAX_SAMPLES", "1440")))
 
-# This intentionally contains tokens only, never user passwords.  Replace it
-# with Redis (and a TTL) when deploying more than one API process.
-sessions: dict[str, dict[str, Any]] = {}
 # Calendar totals belong to the server, not an individual browser session.
 # Deploy Redis or another shared cache when using more than one API process.
 calendar_cache: dict[str, dict[str, Any]] = {}
@@ -48,8 +41,7 @@ logger = logging.getLogger(__name__)
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
     global calendar_runner_task
-    if ADSS_SERVICE_USERNAME and ADSS_SERVICE_PASSWORD:
-        calendar_runner_task = asyncio.create_task(run_calendar_refresh_loop())
+    calendar_runner_task = asyncio.create_task(run_calendar_refresh_loop())
     yield
     if calendar_runner_task:
         calendar_runner_task.cancel()
@@ -67,11 +59,6 @@ app.add_middleware(
 )
 
 
-class LoginRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=256)
-    password: str = Field(min_length=1, max_length=1024)
-
-
 class ConeSearch(BaseModel):
     ra: float = Field(ge=0, lt=360)
     dec: float = Field(ge=-90, le=90)
@@ -84,28 +71,14 @@ class DiscoverySearch(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
 
 
-def portal_session(arandu_session: str | None = Cookie(default=None)) -> dict[str, Any]:
-    if not arandu_session or arandu_session not in sessions:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Please sign in with ADSS.")
-    return sessions[arandu_session]
-
-
-async def adss_rows(session: dict[str, Any], query: str) -> list[dict[str, Any]]:
-    """Run an allow-listed portal query as the signed-in ADSS user.
-
-    The bearer token remains in this server-side session.  The browser sends
-    only its opaque HttpOnly cookie, so a script injected into the page cannot
-    steal an ADSS credential.
-    """
+async def adss_rows(query: str) -> list[dict[str, Any]]:
+    """Run an allow-listed public portal query through ADSS."""
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             result = await client.post(
                 f"{ADSS_BASE_URL}/adss/sync",
                 data={"query": query, "mode": "astroql"},
-                headers={"Authorization": f"Bearer {session['token']}"},
             )
-        if result.status_code in (401, 403):
-            raise HTTPException(status_code=401, detail="Your ADSS session has expired. Please sign in again.")
         result.raise_for_status()
         return pq.read_table(BytesIO(result.content)).to_pylist()
     except HTTPException:
@@ -114,25 +87,6 @@ async def adss_rows(session: dict[str, Any], query: str) -> list[dict[str, Any]]
         # ADSS may return a query error, a transient error, or malformed data.
         # Keep the server response private while giving the UI an actionable status.
         raise HTTPException(status_code=502, detail="ADSS could not complete the data query.") from exc
-
-
-async def adss_service_session() -> dict[str, str]:
-    """Log in the calendar worker and return a newly-issued ADSS token."""
-    if not ADSS_SERVICE_USERNAME or not ADSS_SERVICE_PASSWORD:
-        raise RuntimeError("ADSS service credentials are not configured")
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"{ADSS_BASE_URL}/adss/v1/auth/login",
-                data={"username": ADSS_SERVICE_USERNAME, "password": ADSS_SERVICE_PASSWORD},
-            )
-        response.raise_for_status()
-        token = response.json().get("access_token")
-        if not token:
-            raise RuntimeError("ADSS service login returned no access token")
-        return {"token": token}
-    except httpx.HTTPError as exc:
-        raise RuntimeError("ADSS service login failed") from exc
 
 
 @app.get("/api/health")
@@ -169,7 +123,7 @@ def read_monitor_history() -> list[dict[str, Any]]:
 
 
 @app.get("/api/status")
-def monitor_status(_: dict[str, Any] = Depends(portal_session)):
+def monitor_status():
     samples = read_monitor_history()
     if not samples:
         raise HTTPException(status_code=503, detail="Monitor history does not contain any valid samples yet.")
@@ -197,47 +151,6 @@ def monitor_status(_: dict[str, Any] = Depends(portal_session)):
         "sample_count": len(samples),
         "all_services_healthy": monitor_ok(latest),
     }
-
-
-@app.post("/api/auth/login")
-async def login(payload: LoginRequest, response: Response):
-    # ADSS receives the submitted password over HTTPS. It is not logged,
-    # persisted, or returned to the browser.
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            auth = await client.post(
-                f"{ADSS_BASE_URL}/adss/v1/auth/login",
-                data={"username": payload.username, "password": payload.password},
-            )
-            if auth.status_code in (401, 403):
-                raise HTTPException(status_code=401, detail="Invalid ADSS username or password.")
-            auth.raise_for_status()
-            token = auth.json().get("access_token")
-            if not token:
-                raise HTTPException(status_code=502, detail="ADSS did not return an access token.")
-            me = await client.get(f"{ADSS_BASE_URL}/adss/v1/users/me", headers={"Authorization": f"Bearer {token}"})
-            me.raise_for_status()
-    except HTTPException:
-        raise
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Could not reach ADSS.") from exc
-
-    session_id = secrets.token_urlsafe(32)
-    sessions[session_id] = {"token": token, "user": me.json()}
-    response.set_cookie("arandu_session", session_id, httponly=True, secure=COOKIE_SECURE, samesite="lax", max_age=8 * 3600, path="/")
-    return {"user": me.json()}
-
-
-@app.post("/api/auth/logout", status_code=204)
-def logout(response: Response, arandu_session: str | None = Cookie(default=None)):
-    if arandu_session:
-        sessions.pop(arandu_session, None)
-    response.delete_cookie("arandu_session", path="/")
-
-
-@app.get("/api/auth/me")
-def me(session: dict[str, Any] = Depends(portal_session)):
-    return {"user": session["user"]}
 
 
 def documentation_file(relative_path: str) -> Path:
@@ -272,7 +185,7 @@ def documentation_asset(asset_path: str):
     return FileResponse(documentation_file(asset_path), headers={"Cache-Control": "no-store, max-age=0"})
 
 
-async def refresh_calendar_range(session: dict[str, Any], start: date, end: date) -> None:
+async def refresh_calendar_range(start: date, end: date) -> None:
     """Populate cached daily detection totals without fetching every source.
 
     A count is issued for each UTC day so its range predicate can use the
@@ -296,7 +209,7 @@ async def refresh_calendar_range(session: dict[str, Any], start: date, end: date
             first_mjd, last_mjd = (day - MJD_EPOCH).days, (day + timedelta(days=1) - MJD_EPOCH).days
             try:
                 async with semaphore:
-                    rows = await adss_rows(session, f"""
+                    rows = await adss_rows(f"""
                         SELECT COUNT(dia_source.midpoint_mjd_tai) AS detections
                         FROM arandu.dia_source
                         WHERE midpoint_mjd_tai >= {first_mjd}
@@ -317,11 +230,11 @@ async def refresh_calendar_range(session: dict[str, Any], start: date, end: date
         calendar_jobs.discard(job)
 
 
-async def calendar_detection_count(session: dict[str, Any], day: date) -> int:
+async def calendar_detection_count(day: date) -> int:
     """Return the current detection count for one UTC calendar day."""
     first_mjd = (day - MJD_EPOCH).days
     last_mjd = (day + timedelta(days=1) - MJD_EPOCH).days
-    rows = await adss_rows(session, f"""
+    rows = await adss_rows(f"""
         SELECT COUNT(dia_source.midpoint_mjd_tai) AS detections
         FROM arandu.dia_source
         WHERE midpoint_mjd_tai >= {first_mjd}
@@ -331,15 +244,11 @@ async def calendar_detection_count(session: dict[str, Any], day: date) -> int:
 
 
 async def run_calendar_refresh_loop() -> None:
-    """Refresh the server-wide calendar cache once per UTC day with a fresh token."""
+    """Refresh the server-wide calendar cache once per UTC day."""
     while True:
         today = datetime.now(timezone.utc).date()
         try:
-            await refresh_calendar_range(
-                await adss_service_session(),
-                today - timedelta(days=CALENDAR_CACHE_LOOKBACK_DAYS),
-                today + timedelta(days=1),
-            )
+            await refresh_calendar_range(today - timedelta(days=CALENDAR_CACHE_LOOKBACK_DAYS), today + timedelta(days=1))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -350,7 +259,7 @@ async def run_calendar_refresh_loop() -> None:
 
 
 @app.get("/api/calendar")
-async def calendar(start: date = Query(...), end: date = Query(...), session: dict[str, Any] = Depends(portal_session)):
+async def calendar(start: date = Query(...), end: date = Query(...)):
     if end <= start or end - start > timedelta(days=370):
         raise HTTPException(status_code=422, detail="Choose a range from one to 370 days.")
     requested_days = [start + timedelta(days=offset) for offset in range((end - start).days)]
@@ -360,11 +269,11 @@ async def calendar(start: date = Query(...), end: date = Query(...), session: di
 
     # Today's observations continue arriving after the daily cache is built.
     # Replace only that entry with a live aggregate so the highlighted cell
-    # always reflects the current ADSS result for the signed-in user.
+    # always reflects the current ADSS result.
     if today in requested_days:
         try:
             today_index = requested_days.index(today)
-            days[today_index] = {"day": today.isoformat(), "detections": await calendar_detection_count(session, today)}
+            days[today_index] = {"day": today.isoformat(), "detections": await calendar_detection_count(today)}
         except (HTTPException, KeyError, TypeError, ValueError):
             # An unavailable live query should not take the calendar down; the
             # last completed cache value remains the useful fallback.
@@ -374,9 +283,9 @@ async def calendar(start: date = Query(...), end: date = Query(...), session: di
 
 
 @app.post("/api/search/cone")
-async def cone_search(payload: ConeSearch, session: dict[str, Any] = Depends(portal_session)):
+async def cone_search(payload: ConeSearch):
     radius_deg = payload.radius_arcsec / 3600.0
-    result = await adss_rows(session, f"""
+    result = await adss_rows(f"""
         SELECT TOP {payload.limit} o.dia_object_id, o.ra, o.dec, o.n_dia_sources,
                o.first_dia_source_mjd_tai, o.last_dia_source_mjd_tai
         FROM arandu.dia_object AS o
@@ -404,11 +313,11 @@ def enrichment_label(value: Any) -> str | None:
     return None
 
 
-async def objects_by_ids(session: dict[str, Any], object_ids: list[int]) -> list[dict[str, Any]]:
+async def objects_by_ids(object_ids: list[int]) -> list[dict[str, Any]]:
     if not object_ids:
         return []
     identifiers = ", ".join(str(item) for item in object_ids)
-    rows = await adss_rows(session, f"""
+    rows = await adss_rows(f"""
         SELECT dia_object_id, ra, dec, n_dia_sources, first_dia_source_mjd_tai, last_dia_source_mjd_tai
         FROM arandu.dia_object WHERE dia_object_id IN ({identifiers})
     """)
@@ -417,7 +326,7 @@ async def objects_by_ids(session: dict[str, Any], object_ids: list[int]) -> list
 
 
 @app.post("/api/search/discovery")
-async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = Depends(portal_session)):
+async def discovery_search(payload: DiscoverySearch):
     """Search objects through a concise, allow-listed discovery language."""
     query = payload.query.strip()
     cone_match = re.fullmatch(r"(?:cone:\s*)?([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)(?:\s*/\s*(\d+(?:\.\d+)?))?", query, flags=re.IGNORECASE)
@@ -426,7 +335,7 @@ async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = D
         radius_arcsec = radius / (divisor or 1)
         if not 0 <= ra < 360 or not -90 <= dec <= 90 or not 0 < radius_arcsec <= 7200:
             raise HTTPException(status_code=422, detail="Use RA 0–360, Dec −90–90, and a radius up to 7200 arcsec.")
-        return await cone_search(ConeSearch(ra=ra, dec=dec, radius_arcsec=radius_arcsec, limit=payload.limit), session)
+        return await cone_search(ConeSearch(ra=ra, dec=dec, radius_arcsec=radius_arcsec, limit=payload.limit))
 
     directive_pattern = re.compile(r"(classification|last)\s*:\s*([A-Za-z0-9_.-]+)", flags=re.IGNORECASE)
     directives = {match.group(1).lower(): match.group(2) for match in directive_pattern.finditer(query)}
@@ -441,12 +350,12 @@ async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = D
             raise HTTPException(status_code=422, detail="The number after last: must be at least one.")
         classification = directives.get("classification")
         if not classification:
-            rows = await adss_rows(session, f"""
+            rows = await adss_rows(f"""
                 SELECT TOP {count} dia_object_id FROM arandu.dia_source
                 ORDER BY midpoint_mjd_tai DESC
             """)
-            return {"objects": await objects_by_ids(session, object_ids_from_rows(rows)), "description": f"Newest {count} detections"}
-        rows = await adss_rows(session, f"""
+            return {"objects": await objects_by_ids(object_ids_from_rows(rows)), "description": f"Newest {count} detections"}
+        rows = await adss_rows(f"""
             SELECT TOP {count * 40} s.dia_object_id, e.value
             FROM arandu.enrichment e JOIN arandu.dia_source s USING (dia_source_id)
             ORDER BY s.midpoint_mjd_tai DESC
@@ -456,23 +365,23 @@ async def discovery_search(payload: DiscoverySearch, session: dict[str, Any] = D
         if "last" in directives:
             description = f"Newest {count} matching observations · {description}"
         result_rows = matched_rows[:count] if "last" in directives else matched_rows
-        return {"objects": await objects_by_ids(session, object_ids_from_rows(result_rows)[:payload.limit]), "description": description}
+        return {"objects": await objects_by_ids(object_ids_from_rows(result_rows)[:payload.limit]), "description": description}
 
     raise HTTPException(status_code=422, detail="Try a cone such as 0.1 0.1 10/3600, classification:<label>, or last:<count>.")
 
 
 @app.get("/api/objects/{object_id}")
-async def object_detail(object_id: int, session: dict[str, Any] = Depends(portal_session)):
-    object_rows = await adss_rows(session, f"SELECT * FROM arandu.dia_object WHERE dia_object_id = {object_id}")
+async def object_detail(object_id: int):
+    object_rows = await adss_rows(f"SELECT * FROM arandu.dia_object WHERE dia_object_id = {object_id}")
     if not object_rows:
         raise HTTPException(status_code=404, detail="Object not found.")
-    source_rows = await adss_rows(session, f"""
+    source_rows = await adss_rows(f"""
         SELECT TOP 10000 s.dia_source_id, s.midpoint_mjd_tai, s.ra, s.dec, s.band,
                s.psf_flux, s.psf_flux_err, s.snr, s.reliability
         FROM arandu.dia_source s
         WHERE s.dia_object_id = {object_id} ORDER BY s.midpoint_mjd_tai
     """)
-    enrichment_rows = await adss_rows(session, f"""
+    enrichment_rows = await adss_rows(f"""
         SELECT e.enrichment_id, e.dia_source_id, e.enricher_name, e.version,
                e.value, e.additionals, e.enriched_at
         FROM arandu.enrichment e JOIN arandu.dia_source s USING (dia_source_id)

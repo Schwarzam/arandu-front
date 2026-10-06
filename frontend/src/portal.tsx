@@ -3,11 +3,10 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Bar, Line, Scatter } from 'react-chartjs-2'
 import { BarElement, CategoryScale, Chart as ChartJS, Filler, Legend, LineElement, LinearScale, PointElement, Tooltip } from 'chart.js'
-import { Activity, BookOpen, CalendarDays, ChevronLeft, ChevronRight, Crosshair, LogIn, LogOut, Moon, RefreshCw, Search, Sun, X } from 'lucide-react'
+import { Activity, BookOpen, CalendarDays, ChevronLeft, ChevronRight, Crosshair, Moon, RefreshCw, Search, Sun, X } from 'lucide-react'
 
 ChartJS.register(BarElement, CategoryScale, Filler, Legend, LineElement, LinearScale, PointElement, Tooltip)
 
-type User = { username?: string; name?: string; email?: string }
 type DayTotal = { day: string; detections: number }
 type Document = { path: string; title: string; section: string }
 type SearchObject = { dia_object_id: number; ra: number; dec: number; n_dia_sources?: number; separation_arcsec: number }
@@ -60,12 +59,6 @@ function FitsCutout({ src, alt }: { src: string; alt: string }) {
   const canvas = useRef<HTMLCanvasElement>(null), [error, setError] = useState(false)
   useEffect(() => { let cancelled = false; setError(false); fetch(src).then(response => { if (!response.ok) throw new Error('Cutout unavailable'); return response.arrayBuffer() }).then(buffer => { if (!cancelled && canvas.current) renderFits(buffer, canvas.current) }).catch(() => !cancelled && setError(true)); return () => { cancelled = true } }, [src])
   return error ? <p className="cutout-error">Unavailable</p> : <canvas ref={canvas} role="img" aria-label={alt} />
-}
-
-function Login({ onLogin }: { onLogin: (user: User) => void }) {
-  const [username, setUsername] = useState(''), [password, setPassword] = useState(''), [error, setError] = useState(''), [busy, setBusy] = useState(false)
-  async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); setError(''); try { onLogin((await api<{ user: User }>('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) })).user) } catch (err) { setError(err instanceof Error ? err.message : 'Could not sign in.') } finally { setBusy(false) } }
-  return <main className="login-shell"><form className="login-card" onSubmit={submit}><img src="/assets/logo.png" alt="Arandu" className="brand-logo" /><h1>Arandu Portal</h1><p>Sign in with your ai-scope account to explore observing activity.</p><label>Username<input autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>{error && <p className="error">{error}</p>}<button disabled={busy}><LogIn size={17} /> {busy ? 'Signing in…' : 'Sign in'}</button></form></main>
 }
 
 function Calendar() {
@@ -134,11 +127,7 @@ function Docs() {
 }
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null), [page, setPage] = useState<'calendar' | 'search' | 'status' | 'docs'>('calendar'), [checking, setChecking] = useState(true), [theme, setTheme] = useState<'light' | 'dark'>(() => localStorage.getItem('arandu-theme') === 'dark' ? 'dark' : 'light')
-  useEffect(() => { api<{ user: User }>('/api/auth/me').then(result => setUser(result.user)).catch(() => {}).finally(() => setChecking(false)) }, [])
+  const [page, setPage] = useState<'calendar' | 'search' | 'status' | 'docs'>('calendar'), [theme, setTheme] = useState<'light' | 'dark'>(() => localStorage.getItem('arandu-theme') === 'dark' ? 'dark' : 'light')
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('arandu-theme', theme) }, [theme])
-  if (checking) return <main className="login-shell">Loading portal…</main>
-  if (!user) return <Login onLogin={setUser} />
-  async function logout() { await api('/api/auth/logout', { method: 'POST' }); setUser(null) }
-  return <div className="app-shell"><header><img src={theme === 'dark' ? '/assets/white_logo.png' : '/assets/logo.png'} alt="Arandu" className="header-logo" /><nav><button className={page === 'calendar' ? 'active' : ''} onClick={() => setPage('calendar')}><CalendarDays size={18} /> Calendar</button><button className={page === 'search' ? 'active' : ''} onClick={() => setPage('search')}><Search size={18} /> Discovery</button><button className={page === 'status' ? 'active' : ''} onClick={() => setPage('status')}><Activity size={18} /> Status</button><button className={page === 'docs' ? 'active' : ''} onClick={() => setPage('docs')}><BookOpen size={18} /> Docs</button></nav><div className="user-menu"><button className="icon-button theme-toggle" title={`Use ${theme === 'light' ? 'dark' : 'light'} theme`} aria-label={`Use ${theme === 'light' ? 'dark' : 'light'} theme`} onClick={() => setTheme(value => value === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={17} /> : <Sun size={17} />}</button><span>{user.name || user.username || user.email || 'ADSS user'}</span><button className="icon-button" title="Sign out" onClick={logout}><LogOut size={18} /></button></div></header>{page === 'calendar' ? <Calendar /> : page === 'search' ? <DiscoverySearch /> : page === 'status' ? <Status /> : <Docs />}</div>
+  return <div className="app-shell"><header><img src={theme === 'dark' ? '/assets/white_logo.png' : '/assets/logo.png'} alt="Arandu" className="header-logo" /><nav><button className={page === 'calendar' ? 'active' : ''} onClick={() => setPage('calendar')}><CalendarDays size={18} /> Calendar</button><button className={page === 'search' ? 'active' : ''} onClick={() => setPage('search')}><Search size={18} /> Discovery</button><button className={page === 'status' ? 'active' : ''} onClick={() => setPage('status')}><Activity size={18} /> Status</button><button className={page === 'docs' ? 'active' : ''} onClick={() => setPage('docs')}><BookOpen size={18} /> Docs</button></nav><div className="user-menu"><button className="icon-button theme-toggle" title={`Use ${theme === 'light' ? 'dark' : 'light'} theme`} aria-label={`Use ${theme === 'light' ? 'dark' : 'light'} theme`} onClick={() => setTheme(value => value === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={17} /> : <Sun size={17} />}</button></div></header>{page === 'calendar' ? <Calendar /> : page === 'search' ? <DiscoverySearch /> : page === 'status' ? <Status /> : <Docs />}</div>
 }
