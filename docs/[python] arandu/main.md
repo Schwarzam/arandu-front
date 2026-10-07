@@ -1,5 +1,11 @@
 # Python access
 
+## Install
+
+```bash
+pip install arandu-broker adss
+```
+
 ## Connect
 
 The normal interactive client is simply:
@@ -146,8 +152,6 @@ usable = client.raw_query("""
 ```
 
 ## Alert cutouts
-
-Install the optional dependency first: `pip install -e '.[cutouts]'`.
 
 ```python
 import matplotlib.pyplot as plt
