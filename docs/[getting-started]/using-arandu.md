@@ -22,4 +22,4 @@ The position-search format is right ascension, declination, and radius in arcsec
 
 ## Programmatic access
 
-For Python tutorials and API access through AI-SCOPE, visit the [AI-SCOPE Python documentation](https://ai-scope.cbpf.br/documentation/python).
+For Python tutorials and API access, see the [Python access guide](../[python] arandu/main.md).
